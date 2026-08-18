@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+web/node_modules/
+web/dist/
+*.py[cod]
+.pytest_cache/
+cookies.txt
+data/video.*
+data/audio.*
+data/frames/
+data/index.faiss
+data/documents.json
+data/*.json
+*.mp4
+*.webm
+*.mkv
