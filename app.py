@@ -41,17 +41,32 @@ def download_video(url: str, destination: Path, cookies: Path | None = None) -> 
     return destination
 
 
-def extract_frames(video: Path, frame_dir: Path, interval: float) -> list[dict]:
-    """Extract frames using ffmpeg.
-
-    Allows specifying an explicit ffmpeg executable via the FFMPEG_PATH environment
-    variable. Falls back to shutil.which('ffmpeg') if not set.
-    """
+def ensure_ffmpeg() -> str:
     ffmpeg_exe = os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg")
+    if not ffmpeg_exe:
+        # Fallback check for standard Windows WinGet location
+        winget_pattern = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/WinGet/Packages"
+        if winget_pattern.exists():
+            for p in winget_pattern.glob("**/ffmpeg.exe"):
+                ffmpeg_exe = str(p)
+                os.environ["FFMPEG_PATH"] = ffmpeg_exe
+                bin_dir = str(p.parent)
+                if bin_dir not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+                break
     if not ffmpeg_exe:
         raise RuntimeError(
             "FFmpeg is required and must be available on PATH or set the FFMPEG_PATH environment variable."
         )
+    bin_dir = str(Path(ffmpeg_exe).parent)
+    if bin_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+    return ffmpeg_exe
+
+
+def extract_frames(video: Path, frame_dir: Path, interval: float) -> list[dict]:
+    """Extract frames using ffmpeg."""
+    ffmpeg_exe = ensure_ffmpeg()
     frame_dir.mkdir(parents=True, exist_ok=True)
     for old_frame in frame_dir.glob("frame_*.jpg"):
         old_frame.unlink()
@@ -69,6 +84,7 @@ def extract_frames(video: Path, frame_dir: Path, interval: float) -> list[dict]:
 def transcribe(video: Path, device: str) -> list[dict]:
     import whisper
 
+    ensure_ffmpeg()
     model = whisper.load_model("base", device=device)
     return model.transcribe(str(video), fp16=device == "cuda")["segments"]
 
@@ -128,9 +144,50 @@ def search(query: str, index_path: Path, metadata_path: Path, top_k: int) -> Non
         print(f"   {item['text']}\n   frame: {item.get('path', 'n/a')}")
 
 
-def main() -> None:
+def process_pipeline(
+    video: Path,
+    data_dir: Path,
+    interval: float = 5.0,
+    progress_callback: callable | None = None,
+) -> dict:
     import torch
 
+    def update_progress(msg: str):
+        if progress_callback:
+            progress_callback(msg)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    frames_dir = data_dir / "frames"
+    index_path = data_dir / "index.faiss"
+    docs_path = data_dir / "documents.json"
+
+    update_progress("Extracting frames with FFmpeg...")
+    frames = extract_frames(video, frames_dir, interval)
+
+    update_progress("Transcribing audio with Whisper...")
+    segments = transcribe(video, device)
+
+    update_progress(f"Generating captions for {len(frames)} frames with BLIP...")
+    captions = caption_frames(frames, device)
+
+    update_progress("Building FAISS search index...")
+    documents = (
+        [{"text": "Auditory: " + s["text"].strip(), "timestamp": s["start"]} for s in segments]
+        + captions
+    )
+    documents.sort(key=lambda item: item["timestamp"])
+    build_index(documents, index_path, docs_path)
+
+    update_progress("Complete")
+    return {
+        "ok": True,
+        "frames": len(frames),
+        "segments": len(segments),
+        "device": device,
+    }
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=False)
     source.add_argument("--video", type=Path, help="Existing local video file")
@@ -149,16 +206,7 @@ def main() -> None:
     if not video.exists():
         raise FileNotFoundError("Provide --video or --url; the selected video does not exist.")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    frames = extract_frames(video, data_dir / "frames", args.interval)
-    segments = transcribe(video, device)
-    captions = caption_frames(frames, device)
-    documents = (
-        [{"text": "Auditory: " + s["text"].strip(), "timestamp": s["start"]} for s in segments]
-        + captions
-    )
-    documents.sort(key=lambda item: item["timestamp"])
-    build_index(documents, data_dir / "index.faiss", data_dir / "documents.json")
+    process_pipeline(video, data_dir, args.interval, progress_callback=print)
     search(args.query, data_dir / "index.faiss", data_dir / "documents.json", args.top_k)
 
 
