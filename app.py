@@ -20,24 +20,45 @@ def download_video(url: str, destination: Path, cookies: Path | None = None) -> 
     import yt_dlp
 
     destination.parent.mkdir(parents=True, exist_ok=True)
+    # Remove any existing incomplete or corrupted video file
+    if destination.exists():
+        try:
+            destination.unlink()
+        except Exception:
+            pass
+
+    temp_stem = destination.parent / "temp_download"
+    for old in destination.parent.glob("temp_download*"):
+        try:
+            old.unlink()
+        except Exception:
+            pass
+
     options = {
-        "format": "bv*+ba/b",
-        "outtmpl": str(destination.with_suffix(".%(ext)s")),
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "outtmpl": str(temp_stem) + ".%(ext)s",
         "merge_output_format": "mp4",
         "noplaylist": True,
+        "quiet": False,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
-    if cookies:
+    if cookies and cookies.exists():
         options["cookiefile"] = str(cookies)
+
     with yt_dlp.YoutubeDL(options) as downloader:
         downloader.download([url])
-    candidates = sorted(destination.parent.glob(destination.stem + ".*"))
-    video = next((p for p in candidates if p.suffix.lower() in {".mp4", ".webm", ".mkv", ".mov"}), None)
-    if not video:
+
+    candidates = list(destination.parent.glob("temp_download*.mp4"))
+    if not candidates:
+        candidates = [p for p in destination.parent.glob("temp_download*") if p.suffix.lower() in {".mp4", ".webm", ".mkv", ".mov"}]
+    
+    if not candidates:
         raise FileNotFoundError(f"No downloaded video found in {destination.parent}")
-    if video != destination:
-        if destination.exists():
-            destination.unlink()
-        video.rename(destination)
+
+    downloaded = candidates[0]
+    if destination.exists():
+        destination.unlink()
+    downloaded.rename(destination)
     return destination
 
 
