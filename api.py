@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
+import uuid
 from pathlib import Path
 
 import faiss
@@ -14,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sentence_transformers import SentenceTransformer
 
-from app import build_index, caption_frames, download_video, extract_frames, transcribe
+from app import download_video, process_pipeline
 
 
 ROOT = Path(__file__).parent
@@ -24,6 +26,10 @@ FRAMES = DATA / "frames"
 INDEX = DATA / "index.faiss"
 DOCUMENTS = DATA / "documents.json"
 DATA.mkdir(exist_ok=True)
+
+# In-memory store for background tasks
+# Known limitation: Cleared when server reloads
+tasks: dict[str, dict] = {}
 
 app = FastAPI(title="Multimodal Video Search API")
 app.add_middleware(
@@ -45,6 +51,22 @@ def public_frame_url(path: str | None) -> str | None:
 @app.get("/api/health")
 def health() -> dict:
     return {"ready": INDEX.exists() and DOCUMENTS.exists(), "video": VIDEO.exists()}
+
+
+def _background_worker(task_id: str, video_path: Path, interval: float) -> None:
+    def on_progress(stage: str):
+        if task_id in tasks:
+            tasks[task_id]["stage"] = stage
+
+    try:
+        result = process_pipeline(video_path, DATA, interval, progress_callback=on_progress)
+        tasks[task_id]["status"] = "completed"
+        tasks[task_id]["stage"] = "Complete"
+        tasks[task_id]["result"] = result
+    except Exception as exc:
+        tasks[task_id]["status"] = "failed"
+        tasks[task_id]["stage"] = "Error"
+        tasks[task_id]["error"] = str(exc)
 
 
 @app.post("/api/process")
@@ -69,19 +91,28 @@ async def process_video(
                     shutil.copyfileobj(cookies.file, output)
             download_video(url.strip(), VIDEO, cookie_path)
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        frames = extract_frames(VIDEO, FRAMES, interval)
-        segments = transcribe(VIDEO, device)
-        captions = caption_frames(frames, device)
-        documents = [
-            {"text": "Auditory: " + segment["text"].strip(), "timestamp": segment["start"]}
-            for segment in segments
-        ] + captions
-        documents.sort(key=lambda item: item["timestamp"])
-        build_index(documents, INDEX, DOCUMENTS)
-        return {"ok": True, "frames": len(frames), "segments": len(segments), "device": device}
+        task_id = str(uuid.uuid4())
+        tasks[task_id] = {
+            "task_id": task_id,
+            "status": "processing",
+            "stage": "Starting background worker...",
+            "error": None,
+            "result": None,
+        }
+
+        # Run CPU-bound processing in a separate thread so polling requests remain non-blocking
+        asyncio.create_task(asyncio.to_thread(_background_worker, task_id, VIDEO, interval))
+
+        return {"task_id": task_id, "status": "processing"}
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
+
+
+@app.get("/api/status/{task_id}")
+def get_task_status(task_id: str) -> dict:
+    if task_id not in tasks:
+        raise HTTPException(404, f"Task {task_id} not found.")
+    return tasks[task_id]
 
 
 @app.get("/api/search")

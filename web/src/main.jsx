@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { Brain, ChevronRight, FileVideo, LoaderCircle, Search, Sparkles, Upload, Zap } from 'lucide-react'
 import './styles.css'
 
-const API = 'http://localhost:8000'
+const API = 'http://localhost:8001'
 const formatTime = (seconds) => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${(seconds % 60).toFixed(1).padStart(4, '0')}`
 
 export default function App() {
@@ -18,7 +18,8 @@ export default function App() {
 
   async function processVideo(event) {
     event.preventDefault()
-    setBusy(true); setMessage('Analyzing video: extracting frames, listening to audio, and captioning scenes…')
+    setBusy(true)
+    setMessage('Initiating video processing…')
     const form = new FormData()
     if (file) form.append('video', file)
     if (url) form.append('url', url)
@@ -26,9 +27,39 @@ export default function App() {
     try {
       const response = await fetch(`${API}/api/process`, { method: 'POST', body: form })
       const data = await response.json()
-      if (!response.ok) throw new Error(data.detail || 'Processing failed')
-      setStats(data); setMessage(`Index ready · ${data.frames} frames · ${data.segments} transcript segments · ${data.device}`)
-    } catch (error) { setMessage(error.message) } finally { setBusy(false) }
+      if (!response.ok) throw new Error(data.detail || 'Failed to start processing')
+
+      const taskId = data.task_id
+      setMessage('Processing started in background…')
+
+      const poll = setInterval(async () => {
+        try {
+          const res = await fetch(`${API}/api/status/${taskId}`)
+          if (!res.ok) throw new Error('Failed to fetch task status')
+          const task = await res.json()
+
+          if (task.status === 'completed') {
+            clearInterval(poll)
+            setStats(task.result)
+            setMessage(`Index ready · ${task.result.frames} frames · ${task.result.segments} transcript segments · ${task.result.device}`)
+            setBusy(false)
+          } else if (task.status === 'failed') {
+            clearInterval(poll)
+            setMessage(`Error: ${task.error}`)
+            setBusy(false)
+          } else {
+            setMessage(task.stage || 'Processing video…')
+          }
+        } catch (pollErr) {
+          clearInterval(poll)
+          setMessage(`Status error: ${pollErr.message}`)
+          setBusy(false)
+        }
+      }, 1000)
+    } catch (error) {
+      setMessage(error.message)
+      setBusy(false)
+    }
   }
 
   async function searchVideo(event) {
